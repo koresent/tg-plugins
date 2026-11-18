@@ -3,14 +3,14 @@
   "name": "koresent Plugins",
   "description": "Personal collection of plugins for exteraGram and its forks.",
   "author": "@koresent",
-  "homepage": "https://github.com/koresent/telegram-plugins",
+  "homepage": "https://github.com/koresent/tg-plugins",
   "plugins": [
     {
       "id": "avatar_online_ring",
       "name": "Avatar Online Ring",
-      "description": "Replaces the online status dot indicator with a circular ring around user avatars",
+      "description": "Replaces the online status dot indicator with a smoothly animated circular ring around user avatars",
       "author": "@koresent",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "icon": "exteraPlugins/1",
       "category": [
         "appearance",
@@ -19,9 +19,9 @@
       "app_version": ">=12.5.1",
       "sdk_version": ">=1.4.4.3",
       "file": "avatar_online_ring/avatar_online_ring.plugin",
-      "sha256": "368e2fe7d38b5a594b6fb5959b3e74f8cb4060d157fc1d83dfb9a64fdf70d831",
-      "size": 20428,
-      "updated_at": "2026-11-10T17:04:31Z"
+      "sha256": "4741b8d78473c33dcba6f8f79daefc7423f5530e6f1c59cf544d1c75f8ac52f3",
+      "size": 26266,
+      "updated_at": "2026-11-18T21:28:53Z"
     },
     {
       "id": "bot_web_tabs",
@@ -112,9 +112,9 @@
       "app_version": ">=12.5.1",
       "sdk_version": ">=1.4.4.3",
       "file": "plugin_updater/plugin_updater.plugin",
-      "sha256": "f7326bd10c33e56f2341b38ba18ce20d7bb8ca47c467f05b86a15eb3a354ffab",
-      "size": 22241,
-      "updated_at": "2026-11-10T17:15:27Z"
+      "sha256": "46576303c9e83b728d9836a1d1c0fe95f3a1442073c05d4138d94e31cb184e65",
+      "size": 22235,
+      "updated_at": "2026-11-18T21:30:00Z"
     }
   ]
 }

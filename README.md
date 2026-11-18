@@ -1,4 +1,4 @@
-# Telegram plugins
+# tg-plugins
 
 My personal collection of plugins for [exteraGram](https://github.com/exteraSquad/exteraGram) and its forks.
 

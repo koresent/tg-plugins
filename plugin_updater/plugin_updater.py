@@ -60,7 +60,7 @@ KEY_BRANCH = "github_branch"
 KEY_LAST_CHECK_TS = "last_check_ts"
 KEY_LAST_STATUS = "last_check_status"
 
-DEFAULT_REPO = "koresent/telegram-plugins"
+DEFAULT_REPO = "koresent/tg-plugins"
 DEFAULT_BRANCH = "main"
 
 INTERVAL_CHOICES: List[Tuple[str, int]] = [

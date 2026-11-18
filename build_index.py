@@ -20,7 +20,7 @@ REPOSITORY = {
     "name": "koresent Plugins",
     "description": "Personal collection of plugins for exteraGram and its forks.",
     "author": "@koresent",
-    "homepage": "https://github.com/koresent/telegram-plugins",
+    "homepage": "https://github.com/koresent/tg-plugins",
 }
 
 FIELDS = (
