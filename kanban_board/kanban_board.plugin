@@ -18,7 +18,7 @@ from android.widget import (
     ScrollView,
     TextView,
 )
-from java import dynamic_proxy, jclass
+from java import dynamic_proxy, jclass, jint
 from java.lang import Integer as JInt, Long as JLong
 from java.util import ArrayList
 from org.telegram.messenger import (
@@ -42,7 +42,7 @@ __id__ = "kanban_board"
 __name__ = "Telegram Kanban"
 __description__ = "Native mobile Kanban board synced with Telegram chats, forum topics, and Saved Messages"
 __author__ = "@koresent"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "exteraPlugins/1"
 __category__ = ["productivity", "chats"]
 __app_version__ = ">=12.5.1"
@@ -69,6 +69,15 @@ DEFAULT_PRIORITIES = [
 MENU_ITEM_ID = 889911
 
 
+def to_signed32(val: int) -> int:
+    n = int(val) & 0xFFFFFFFF
+    return (n ^ 0x80000000) - 0x80000000
+
+
+def to_jint(val: int):
+    return jint(to_signed32(val))
+
+
 def dp(val: float) -> int:
     return int(AndroidUtilities.dp(val))
 
@@ -89,13 +98,34 @@ def get_activity():
     return None
 
 
+def get_themed_drawable(name: str, color: Optional[int] = None):
+    try:
+        ctx = ApplicationLoader.applicationContext
+        res = ctx.getResources()
+        pkg = ctx.getPackageName()
+        rid = res.getIdentifier(name, "drawable", pkg)
+        if rid != 0:
+            d = res.getDrawable(rid)
+            if d:
+                d = d.mutate()
+                if color is not None:
+                    d.setTint(to_jint(color))
+                return d
+    except Exception:
+        pass
+    return None
+
+
 class RequestDelegateProxy(dynamic_proxy(RequestDelegate)):
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
 
     def run(self, response, error):
-        self.callback(response, error)
+        try:
+            self.callback(response, error)
+        except Exception:
+            pass
 
 
 class OnClickListenerProxy(dynamic_proxy(View.OnClickListener)):
@@ -135,11 +165,21 @@ def create_kanban_icon_drawable(size_dp: float = 24.0, color: int = 0xFFFFFFFF) 
 def create_rounded_drawable(bg_color: int, radius_dp: float, stroke_color: Optional[int] = None, stroke_dp: float = 0) -> GradientDrawable:
     d = GradientDrawable()
     d.setShape(GradientDrawable.RECTANGLE)
-    d.setCornerRadius(dp(radius_dp))
-    d.setColor(bg_color)
+    d.setCornerRadius(float(dp(radius_dp)))
+    d.setColor(to_jint(bg_color))
     if stroke_color is not None and stroke_dp > 0:
-        d.setStroke(dp(stroke_dp), stroke_color)
+        d.setStroke(dp(stroke_dp), to_jint(stroke_color))
     return d
+
+
+class DialogsLifecycleHook(MethodHook):
+    def __init__(self, plugin: "KanbanBoardPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        target = param.thisObject
+        run_on_ui_thread(lambda: self.plugin._attach_header_button(target))
 
 
 class KanbanBoardPlugin(BasePlugin):
@@ -155,12 +195,19 @@ class KanbanBoardPlugin(BasePlugin):
         self._search_query: str = ""
         self._sheet: Optional[Any] = None
         self._keep_alive_proxies: List[Any] = []
+        self._unhooks: List[Any] = []
 
     def on_plugin_load(self):
+        self._install_hooks()
         run_on_ui_thread(self._attach_header_button)
-        self._hook_dialogs_resume()
 
     def on_plugin_unload(self):
+        for u in self._unhooks:
+            try:
+                self.unhook_method(u)
+            except Exception:
+                pass
+        self._unhooks.clear()
         run_on_ui_thread(self._detach_header_button)
         if self._sheet:
             try:
@@ -169,39 +216,58 @@ class KanbanBoardPlugin(BasePlugin):
                 pass
             self._sheet = None
 
-    def _hook_dialogs_resume(self):
-        plugin_self = self
-        DialogsActivity = find_class("org.telegram.ui.DialogsActivity")
-        if not DialogsActivity:
-            return
+    def _install_hooks(self):
+        hook = DialogsLifecycleHook(self)
+        for cls_name in ["org.telegram.ui.DialogsActivity", "org.telegram.ui.MainTabsActivity"]:
+            cls = find_class(cls_name)
+            if not cls:
+                continue
+            for m_name in ["createView", "onResume"]:
+                try:
+                    unhooks = self.hook_all_methods(cls, m_name, hook)
+                    if unhooks:
+                        self._unhooks.extend(unhooks)
+                except Exception as e:
+                    self.log(f"Hook error {cls_name}.{m_name}: {e}")
 
-        class DialogsResumeHook(MethodHook):
-            def after_hook(self, target, args, result):
-                run_on_ui_thread(plugin_self._attach_header_button)
-
+    def _attach_header_button(self, target_fragment=None):
         try:
-            self.hook_method(DialogsActivity, "onResume", DialogsResumeHook)
-        except Exception as e:
-            self.log(f"DialogsActivity.onResume hook failed: {e}")
+            frag = target_fragment or get_last_fragment()
+            if not frag:
+                return
 
-    def _attach_header_button(self):
-        try:
-            frag = get_last_fragment()
             da = getattr(frag, "dialogsActivity", None) or frag
             ab = getattr(da, "actionBar", None) or (da.getActionBar() if hasattr(da, "getActionBar") else None)
             if not ab:
                 return
 
             menu = ab.createMenu()
+            if not menu:
+                return
+
+            existing = None
             for i in range(menu.getChildCount() - 1, -1, -1):
                 ch = menu.getChildAt(i)
-                if ch and (ch.getTag() == "kanban_btn" or getattr(ch, "getId", lambda: -1)() == MENU_ITEM_ID):
-                    menu.removeView(ch)
+                if ch:
+                    tag = ch.getTag()
+                    desc = str(ch.getContentDescription() or "")
+                    if tag == "kanban_btn" or tag == MENU_ITEM_ID or "kanban" in str(tag).lower() or "kanban" in desc.lower():
+                        if existing is None:
+                            existing = ch
+                        else:
+                            menu.removeView(ch)
+
+            if existing is not None:
+                existing.setVisibility(View.VISIBLE)
+                menu.requestLayout()
+                return
 
             color = Theme.getColor(Theme.key_actionBarDefaultIcon)
             drawable = create_kanban_icon_drawable(24.0, color)
 
-            item = menu.addItem(MENU_ITEM_ID, drawable)
+            item = menu.addItem(to_jint(MENU_ITEM_ID), drawable)
+            if not item:
+                return
             item.setTag("kanban_btn")
             item.setOverrideMenuClick(True)
             item.setContentDescription("Kanban Board")
@@ -219,348 +285,442 @@ class KanbanBoardPlugin(BasePlugin):
     def _detach_header_button(self):
         try:
             frag = get_last_fragment()
+            if not frag:
+                return
             da = getattr(frag, "dialogsActivity", None) or frag
             ab = getattr(da, "actionBar", None) or (da.getActionBar() if hasattr(da, "getActionBar") else None)
             if ab:
                 menu = ab.createMenu()
                 for i in range(menu.getChildCount() - 1, -1, -1):
                     ch = menu.getChildAt(i)
-                    if ch and (ch.getTag() == "kanban_btn" or getattr(ch, "getId", lambda: -1)() == MENU_ITEM_ID):
-                        menu.removeView(ch)
+                    if ch:
+                        tag = ch.getTag()
+                        desc = str(ch.getContentDescription() or "")
+                        if tag == "kanban_btn" or tag == MENU_ITEM_ID or "kanban" in str(tag).lower() or "kanban" in desc.lower():
+                            menu.removeView(ch)
                 menu.requestLayout()
         except Exception as e:
             self.log(f"Error detaching header button: {e}")
+
+    def log(self, msg: str):
+        try:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.info(msg)
+            else:
+                from android_utils import log as a_log
+                a_log(f"[KanbanBoard] {msg}")
+        except Exception:
+            pass
 
     def _get_account_instance(self):
         account = UserConfig.selectedAccount
         from org.telegram.messenger import AccountInstance
         return AccountInstance.getInstance(account)
 
-    def _load_boards_registry(self, on_done):
-        ai = self._get_account_instance()
-        req = TLRPC.TL_messages_getHistory()
-        req.peer = ai.getMessagesController().getInputPeer(ai.getUserConfig().getClientUserId())
-        req.limit = 50
-        req.offset_id = 0
-        req.offset_date = 0
-        req.add_offset = 0
-        req.max_id = 0
-        req.min_id = 0
-        req.hash = 0
-
-        def handle_resp(resp, err):
-            boards = []
-            if not err and hasattr(resp, "messages"):
-                msgs = resp.messages
-                for i in range(msgs.size()):
-                    m = msgs.get(i)
-                    txt = getattr(m, "message", "") or ""
-                    if "<!--kanban-boards:" in txt:
-                        match = KANBAN_BOARDS_REGEX.search(txt)
-                        if match:
-                            try:
-                                json_boards = json.loads(match.group(1))
-                                if isinstance(json_boards, list):
-                                    for jb in json_boards:
-                                        p_id = jb.get("peerId")
-                                        t_id = jb.get("topicId")
-                                        if p_id is not None:
-                                            boards.append({
-                                                "id": jb.get("id") or f"board_{p_id}_{t_id or 0}",
-                                                "peerId": int(p_id),
-                                                "topicId": int(t_id) if t_id else None,
-                                                "title": jb.get("title")
-                                            })
-                            except Exception:
-                                pass
-
-                        for line in txt.splitlines():
-                            m_link = re.search(r"t\.me/c/(\d+)(?:/(\d+))?", line)
-                            if m_link:
-                                c_id = int(m_link.group(1))
-                                t_id = int(m_link.group(2)) if m_link.group(2) else None
-                                b_id = f"board_{c_id}_{t_id or 0}"
-                                if not any(b["id"] == b_id for b in boards):
-                                    boards.append({
-                                        "id": b_id,
-                                        "peerId": -c_id,
-                                        "topicId": t_id,
-                                        "title": None
-                                    })
-                        break
-
-            mc = ai.getMessagesController()
-            tc = mc.getTopicsController()
-            for b in boards:
-                if not b["title"]:
-                    p_id = b["peerId"]
-                    c_id = abs(p_id)
-                    if c_id > 1000000000000:
-                        c_id -= 1000000000000
-                    if b["topicId"] and tc:
-                        try:
-                            topic = tc.findTopic(JLong(c_id).longValue(), JLong(b["topicId"]).longValue())
-                            if topic and getattr(topic, "title", None):
-                                b["title"] = topic.title
-                        except Exception:
-                            pass
-                    if not b["title"]:
-                        try:
-                            chat = mc.getChat(JLong(c_id).longValue())
-                            if chat and getattr(chat, "title", None):
-                                b["title"] = chat.title
-                        except Exception:
-                            pass
-                if not b["title"]:
-                    b["title"] = f"Board {b['id']}"
-
-            if not boards:
-                boards.append({
-                    "id": "saved_messages",
-                    "peerId": int(ai.getUserConfig().getClientUserId()),
-                    "topicId": None,
-                    "title": "Saved Messages"
-                })
-
-            self._boards = boards
-            last_id = self.get_setting("last_active_board_id", boards[0]["id"])
-            active = next((b for b in boards if b["id"] == last_id), boards[0])
-            self._active_board = active
-            on_done(boards, active)
-
-        proxy = RequestDelegateProxy(handle_resp)
-        self._keep_alive_proxies.append(proxy)
-        ai.getConnectionsManager().sendRequest(req, proxy)
-
-    def _load_board_tasks(self, board: Dict[str, Any], on_done):
+    def _resolve_peer_info(self, peer_id: int):
         ai = self._get_account_instance()
         mc = ai.getMessagesController()
-        peer_id = board["peerId"]
-        topic_id = board["topicId"]
 
         abs_p = abs(peer_id)
-        chat_id = abs_p - 1000000000000 if abs_p > 1000000000000 else abs_p
-        chat = mc.getChat(JLong(chat_id).longValue())
+        is_neg = peer_id < 0
+        if is_neg and abs_p > 1000000000000:
+            raw_id = abs_p - 1000000000000
+            norm_did = -raw_id
+        else:
+            raw_id = abs_p
+            norm_did = peer_id
 
-        def handle_resp(resp, err):
-            columns = list(DEFAULT_COLUMNS)
-            priorities = list(DEFAULT_PRIORITIES)
-            tasks = []
-            config_mid = None
+        input_peer = None
+        if norm_did < 0:
+            chat = mc.getChat(JLong(raw_id).longValue())
+            if chat:
+                peer = TLRPC.TL_inputPeerChannel()
+                peer.channel_id = chat.id
+                peer.access_hash = chat.access_hash
+                input_peer = peer
 
-            if not err and hasattr(resp, "messages"):
-                msgs = resp.messages
-                for i in range(msgs.size()):
-                    m = msgs.get(i)
-                    txt = getattr(m, "message", "") or ""
+        if not input_peer or isinstance(input_peer, TLRPC.TL_inputPeerEmpty):
+            try:
+                ip = mc.getInputPeer(JLong(norm_did).longValue())
+                if ip and not isinstance(ip, TLRPC.TL_inputPeerEmpty):
+                    input_peer = ip
+            except Exception:
+                pass
 
-                    if KANBAN_CONFIG_REGEX.search(txt):
-                        match = KANBAN_CONFIG_REGEX.search(txt)
-                        if match:
-                            try:
-                                cfg = json.loads(match.group(1))
-                                if isinstance(cfg.get("columns"), list) and len(cfg["columns"]) > 0:
-                                    columns = cfg["columns"]
-                                if isinstance(cfg.get("priorities"), list) and len(cfg["priorities"]) > 0:
-                                    priorities = cfg["priorities"]
-                                config_mid = m.id
-                            except Exception:
-                                pass
-                        continue
+        if not input_peer and norm_did < 0:
+            try:
+                ichan = mc.getInputChannel(JLong(raw_id).longValue())
+                if ichan and hasattr(ichan, "access_hash"):
+                    peer = TLRPC.TL_inputPeerChannel()
+                    peer.channel_id = ichan.channel_id
+                    peer.access_hash = ichan.access_hash
+                    input_peer = peer
+            except Exception:
+                pass
 
-                    match_task = KANBAN_BLOCK_REGEX.search(txt)
-                    if match_task:
-                        try:
-                            meta = json.loads(match_task.group(1))
-                        except Exception:
-                            meta = {}
+        return norm_did, raw_id, input_peer
 
-                        body = txt[:match_task.start()].strip()
-                        lines = body.splitlines()
-                        title = lines[0].strip() if lines else "Untitled"
-                        desc_lines = lines[1:] if len(lines) > 1 else []
-                        desc = "\n".join(desc_lines).strip()
+    def _load_boards_registry(self, on_done):
+        try:
+            ai = self._get_account_instance()
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = ai.getMessagesController().getInputPeer(ai.getUserConfig().getClientUserId())
+            req.limit = 50
+            req.offset_id = 0
+            req.offset_date = 0
+            req.add_offset = 0
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
 
-                        checklist = []
-                        for idx, l in enumerate(lines):
-                            cm = CHECKLIST_LINE_REGEX.match(l)
-                            if cm:
-                                checklist.append({
-                                    "line_idx": idx,
-                                    "checked": cm.group(2).lower() == "x",
-                                    "text": cm.group(3).strip()
-                                })
+            def handle_resp(resp, err):
+                boards = []
+                try:
+                    if not err and hasattr(resp, "messages"):
+                        msgs = resp.messages
+                        for i in range(msgs.size()):
+                            m = msgs.get(i)
+                            txt = getattr(m, "message", "") or ""
+                            if "<!--kanban-boards:" in txt:
+                                match = KANBAN_BOARDS_REGEX.search(txt)
+                                if match:
+                                    try:
+                                        json_boards = json.loads(match.group(1))
+                                        if isinstance(json_boards, list):
+                                            for jb in json_boards:
+                                                p_id = jb.get("peerId")
+                                                t_id = jb.get("topicId")
+                                                if p_id is not None:
+                                                    p_int = int(p_id)
+                                                    abs_p = abs(p_int)
+                                                    if p_int < 0 and abs_p > 1000000000000:
+                                                        p_int = -(abs_p - 1000000000000)
+                                                    boards.append({
+                                                        "id": jb.get("id") or f"board_{abs(p_int)}_{t_id or 0}",
+                                                        "peerId": p_int,
+                                                        "topicId": int(t_id) if t_id else None,
+                                                        "title": jb.get("title")
+                                                    })
+                                    except Exception:
+                                        pass
 
-                        tasks.append({
-                            "id": m.id,
-                            "col": meta.get("col", "todo"),
-                            "pos": meta.get("pos", 1000),
-                            "prio": meta.get("prio", "medium"),
-                            "title": title,
-                            "description": desc,
-                            "raw_text": txt,
-                            "checklist": checklist,
-                            "total_check": len(checklist),
-                            "done_check": sum(1 for c in checklist if c["checked"]),
-                            "date": m.date
+                                for line in txt.splitlines():
+                                    m_link = re.search(r"t\.me/c/(\d+)(?:/(\d+))?", line)
+                                    if m_link:
+                                        raw_cid = int(m_link.group(1))
+                                        t_id = int(m_link.group(2)) if m_link.group(2) else None
+                                        full_peer_id = -raw_cid
+                                        b_id = f"board_{raw_cid}_{t_id or 0}"
+                                        if not any(b["id"] == b_id for b in boards):
+                                            boards.append({
+                                                "id": b_id,
+                                                "peerId": full_peer_id,
+                                                "topicId": t_id,
+                                                "title": None
+                                            })
+                                break
+
+                    mc = ai.getMessagesController()
+                    tc = mc.getTopicsController()
+                    for b in boards:
+                        if not b.get("title"):
+                            p_id = b["peerId"]
+                            abs_p = abs(p_id)
+                            chat_id = abs_p - 1000000000000 if abs_p > 1000000000000 else abs_p
+                            if b.get("topicId") and tc:
+                                try:
+                                    topic = tc.findTopic(JLong(chat_id).longValue(), JLong(b["topicId"]).longValue())
+                                    if topic and getattr(topic, "title", None):
+                                        b["title"] = topic.title
+                                except Exception:
+                                    pass
+                            if not b.get("title"):
+                                try:
+                                    chat = mc.getChat(JLong(chat_id).longValue())
+                                    if chat and getattr(chat, "title", None):
+                                        b["title"] = chat.title
+                                except Exception:
+                                    pass
+                        if not b.get("title"):
+                            b["title"] = f"Board {b['id']}"
+
+                    if not boards:
+                        boards.append({
+                            "id": "saved_messages",
+                            "peerId": int(ai.getUserConfig().getClientUserId()),
+                            "topicId": None,
+                            "title": "Saved Messages"
                         })
 
-            tasks.sort(key=lambda t: t.get("pos", 1000))
-            self._columns = columns
-            self._priorities = priorities
-            self._tasks = tasks
-            self._config_mid = config_mid
-            on_done(columns, priorities, tasks)
+                    self._boards = boards
+                    last_id = self.get_setting("last_active_board_id", boards[0]["id"])
+                    active = next((b for b in boards if b["id"] == last_id or (last_id and str(abs(b["peerId"])) in str(last_id))), boards[0])
+                    self._active_board = active
+                    on_done(boards, active)
+                except Exception as e:
+                    self.log(f"Error parsing boards registry: {e}")
+                    fallback = [{
+                        "id": "saved_messages",
+                        "peerId": int(ai.getUserConfig().getClientUserId()),
+                        "topicId": None,
+                        "title": "Saved Messages"
+                    }]
+                    self._boards = fallback
+                    self._active_board = fallback[0]
+                    on_done(fallback, fallback[0])
 
-        proxy = RequestDelegateProxy(handle_resp)
-        self._keep_alive_proxies.append(proxy)
+            proxy = RequestDelegateProxy(handle_resp)
+            self._keep_alive_proxies.append(proxy)
+            ai.getConnectionsManager().sendRequest(req, proxy)
+        except Exception as e:
+            self.log(f"Error loading boards registry: {e}")
 
-        if topic_id and chat:
-            peer = TLRPC.TL_inputPeerChannel()
-            peer.channel_id = chat.id
-            peer.access_hash = chat.access_hash
-            req = TLRPC.TL_messages_getReplies()
-            req.peer = peer
-            req.msg_id = topic_id
-            req.limit = 100
-            req.offset_id = 0
-            req.offset_date = 0
-            req.add_offset = 0
-            req.max_id = 0
-            req.min_id = 0
-            req.hash = 0
-            ai.getConnectionsManager().sendRequest(req, proxy)
-        else:
-            req = TLRPC.TL_messages_getHistory()
-            req.peer = mc.getInputPeer(JLong(peer_id).longValue())
-            req.limit = 100
-            req.offset_id = 0
-            req.offset_date = 0
-            req.add_offset = 0
-            req.max_id = 0
-            req.min_id = 0
-            req.hash = 0
-            ai.getConnectionsManager().sendRequest(req, proxy)
+    def _load_board_tasks(self, board: Dict[str, Any], on_done):
+        try:
+            ai = self._get_account_instance()
+            peer_id = board["peerId"]
+            topic_id = board.get("topicId")
+
+            def handle_resp(resp, err):
+                columns = list(DEFAULT_COLUMNS)
+                priorities = list(DEFAULT_PRIORITIES)
+                tasks = []
+                config_mid = None
+
+                try:
+                    if err:
+                        err_text = getattr(err, "text", str(err))
+                        run_on_ui_thread(lambda: BulletinHelper.show_error(f"Load failed: {err_text}"))
+                    elif hasattr(resp, "messages"):
+                        msgs = resp.messages
+                        for i in range(msgs.size()):
+                            m = msgs.get(i)
+                            txt = getattr(m, "message", "") or ""
+
+                            if KANBAN_CONFIG_REGEX.search(txt):
+                                match = KANBAN_CONFIG_REGEX.search(txt)
+                                if match:
+                                    try:
+                                        cfg = json.loads(match.group(1))
+                                        if isinstance(cfg.get("columns"), list) and len(cfg["columns"]) > 0:
+                                            columns = cfg["columns"]
+                                        if isinstance(cfg.get("priorities"), list) and len(cfg["priorities"]) > 0:
+                                            priorities = cfg["priorities"]
+                                        config_mid = m.id
+                                    except Exception:
+                                        pass
+                                continue
+
+                            match_task = KANBAN_BLOCK_REGEX.search(txt)
+                            if match_task:
+                                try:
+                                    meta = json.loads(match_task.group(1))
+                                except Exception:
+                                    meta = {}
+
+                                body = txt[:match_task.start()].strip()
+                                lines = body.splitlines()
+                                title = lines[0].strip() if lines else "Untitled"
+                                desc_lines = lines[1:] if len(lines) > 1 else []
+                                desc = "\n".join(desc_lines).strip()
+
+                                checklist = []
+                                for idx, l in enumerate(lines):
+                                    cm = CHECKLIST_LINE_REGEX.match(l)
+                                    if cm:
+                                        checklist.append({
+                                            "line_idx": idx,
+                                            "checked": cm.group(2).lower() == "x",
+                                            "text": cm.group(3).strip()
+                                        })
+
+                                tasks.append({
+                                    "id": m.id,
+                                    "col": meta.get("col", "todo"),
+                                    "pos": meta.get("pos", 1000),
+                                    "prio": meta.get("prio", "medium"),
+                                    "title": title,
+                                    "description": desc,
+                                    "raw_text": txt,
+                                    "checklist": checklist,
+                                    "total_check": len(checklist),
+                                    "done_check": sum(1 for c in checklist if c["checked"]),
+                                    "date": getattr(m, "date", 0)
+                                })
+                except Exception as e:
+                    self.log(f"Error parsing tasks: {e}")
+
+                tasks.sort(key=lambda t: t.get("pos", 1000))
+                self._columns = columns
+                self._priorities = priorities
+                self._tasks = tasks
+                self._config_mid = config_mid
+                on_done(columns, priorities, tasks)
+
+            proxy = RequestDelegateProxy(handle_resp)
+            self._keep_alive_proxies.append(proxy)
+
+            norm_did, chat_id, input_peer = self._resolve_peer_info(peer_id)
+
+            if topic_id and input_peer:
+                req = TLRPC.TL_messages_getReplies()
+                req.peer = input_peer
+                req.msg_id = topic_id
+                req.limit = 100
+                req.offset_id = 0
+                req.offset_date = 0
+                req.add_offset = 0
+                req.max_id = 0
+                req.min_id = 0
+                req.hash = 0
+                ai.getConnectionsManager().sendRequest(req, proxy)
+            elif input_peer:
+                req = TLRPC.TL_messages_getHistory()
+                req.peer = input_peer
+                req.limit = 100
+                req.offset_id = 0
+                req.offset_date = 0
+                req.add_offset = 0
+                req.max_id = 0
+                req.min_id = 0
+                req.hash = 0
+                ai.getConnectionsManager().sendRequest(req, proxy)
+            else:
+                self.log(f"Cannot resolve input_peer for {board}")
+                on_done(list(DEFAULT_COLUMNS), list(DEFAULT_PRIORITIES), [])
+        except Exception as e:
+            self.log(f"Error loading board tasks: {e}")
+            on_done(list(DEFAULT_COLUMNS), list(DEFAULT_PRIORITIES), [])
 
     def _send_edit_message(self, mid: int, new_text: str, on_done=None):
-        ai = self._get_account_instance()
-        mc = ai.getMessagesController()
-        board = self._active_board
-        if not board:
-            return
+        try:
+            ai = self._get_account_instance()
+            board = self._active_board
+            if not board:
+                return
 
-        peer_id = board["peerId"]
-        abs_p = abs(peer_id)
-        chat_id = abs_p - 1000000000000 if abs_p > 1000000000000 else abs_p
-        chat = mc.getChat(JLong(chat_id).longValue())
+            peer_id = board["peerId"]
+            norm_did, chat_id, input_peer = self._resolve_peer_info(peer_id)
+            if not input_peer:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Peer not resolved"))
+                return
 
-        req = TLRPC.TL_messages_editMessage()
-        if chat:
-            peer = TLRPC.TL_inputPeerChannel()
-            peer.channel_id = chat.id
-            peer.access_hash = chat.access_hash
-            req.peer = peer
-        else:
-            req.peer = mc.getInputPeer(JLong(peer_id).longValue())
+            req = TLRPC.TL_messages_editMessage()
+            req.peer = input_peer
+            req.id = mid
+            req.message = new_text
+            req.no_webpage = True
 
-        req.id = mid
-        req.message = new_text
-        req.no_webpage = True
+            def handle_resp(resp, err):
+                if err:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Edit failed: {err.text}"))
+                if on_done:
+                    on_done(not bool(err))
 
-        def handle_resp(resp, err):
-            if err:
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Edit failed: {err.text}"))
-            if on_done:
-                on_done(not bool(err))
-
-        proxy = RequestDelegateProxy(handle_resp)
-        self._keep_alive_proxies.append(proxy)
-        ai.getConnectionsManager().sendRequest(req, proxy)
+            proxy = RequestDelegateProxy(handle_resp)
+            self._keep_alive_proxies.append(proxy)
+            ai.getConnectionsManager().sendRequest(req, proxy)
+        except Exception as e:
+            self.log(f"Error editing message: {e}")
 
     def _send_new_task_message(self, col_id: str, title: str, description: str, priority: str, on_done=None):
-        ai = self._get_account_instance()
-        mc = ai.getMessagesController()
-        board = self._active_board
-        if not board:
-            return
+        try:
+            ai = self._get_account_instance()
+            board = self._active_board
+            if not board:
+                return
 
-        peer_id = board["peerId"]
-        topic_id = board["topicId"]
-        abs_p = abs(peer_id)
-        chat_id = abs_p - 1000000000000 if abs_p > 1000000000000 else abs_p
-        chat = mc.getChat(JLong(chat_id).longValue())
+            peer_id = board["peerId"]
+            topic_id = board.get("topicId")
+            norm_did, chat_id, input_peer = self._resolve_peer_info(peer_id)
+            if not input_peer:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Peer not resolved"))
+                return
 
-        body = f"{title.strip()}\n{description.strip()}" if description.strip() else title.strip()
-        col_tasks = [t for t in self._tasks if t.get("col") == col_id]
-        next_pos = (max(t.get("pos", 1000) for t in col_tasks) + 1000) if col_tasks else 1000
-        meta = {"col": col_id, "pos": next_pos, "prio": priority}
-        text = f"{body}\n\n---\n<!--kanban:{json.dumps(meta)}-->"
+            body = f"{title.strip()}\n{description.strip()}" if description.strip() else title.strip()
+            col_tasks = [t for t in self._tasks if t.get("col") == col_id]
+            next_pos = (max(t.get("pos", 1000) for t in col_tasks) + 1000) if col_tasks else 1000
+            meta = {"col": col_id, "pos": next_pos, "prio": priority}
+            text = f"{body}\n\n---\n<!--kanban:{json.dumps(meta)}-->"
 
-        req = TLRPC.TL_messages_sendMessage()
-        if chat:
-            peer = TLRPC.TL_inputPeerChannel()
-            peer.channel_id = chat.id
-            peer.access_hash = chat.access_hash
-            req.peer = peer
-        else:
-            req.peer = mc.getInputPeer(JLong(peer_id).longValue())
+            req = TLRPC.TL_messages_sendMessage()
+            req.peer = input_peer
+            req.message = text
+            req.random_id = Utilities.random.nextLong()
 
-        req.message = text
-        req.random_id = Utilities.random.nextLong()
+            if topic_id:
+                reply_to = TLRPC.TL_inputReplyToMessage()
+                reply_to.reply_to_msg_id = topic_id
+                reply_to.top_msg_id = topic_id
+                req.reply_to = reply_to
 
-        if topic_id:
-            reply_to = TLRPC.TL_inputReplyToMessage()
-            reply_to.reply_to_msg_id = topic_id
-            reply_to.top_msg_id = topic_id
-            req.reply_to = reply_to
+            def handle_resp(resp, err):
+                if err:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Create failed: {err.text}"))
+                if on_done:
+                    on_done(not bool(err))
 
-        def handle_resp(resp, err):
-            if err:
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Create failed: {err.text}"))
-            if on_done:
-                on_done(not bool(err))
-
-        proxy = RequestDelegateProxy(handle_resp)
-        self._keep_alive_proxies.append(proxy)
-        ai.getConnectionsManager().sendRequest(req, proxy)
+            proxy = RequestDelegateProxy(handle_resp)
+            self._keep_alive_proxies.append(proxy)
+            ai.getConnectionsManager().sendRequest(req, proxy)
+        except Exception as e:
+            self.log(f"Error sending new task: {e}")
 
     def _send_delete_message(self, mid: int, on_done=None):
-        ai = self._get_account_instance()
-        mc = ai.getMessagesController()
-        board = self._active_board
-        if not board:
-            return
+        try:
+            ai = self._get_account_instance()
+            mc = ai.getMessagesController()
+            board = self._active_board
+            if not board:
+                return
 
-        peer_id = board["peerId"]
-        abs_p = abs(peer_id)
-        chat_id = abs_p - 1000000000000 if abs_p > 1000000000000 else abs_p
-        chat = mc.getChat(JLong(chat_id).longValue())
+            peer_id = board["peerId"]
+            norm_did, chat_id, input_peer = self._resolve_peer_info(peer_id)
 
-        def handle_resp(resp, err):
-            if err:
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Delete failed: {err.text}"))
-            if on_done:
-                on_done(not bool(err))
+            def handle_resp(resp, err):
+                if err:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Delete failed: {err.text}"))
+                if on_done:
+                    on_done(not bool(err))
 
-        proxy = RequestDelegateProxy(handle_resp)
-        self._keep_alive_proxies.append(proxy)
+            proxy = RequestDelegateProxy(handle_resp)
+            self._keep_alive_proxies.append(proxy)
 
-        if chat:
-            req = TLRPC.TL_channels_deleteMessages()
-            req.channel = mc.getInputChannel(chat)
-            arr = ArrayList()
-            arr.add(JInt(mid))
-            req.id = arr
-            ai.getConnectionsManager().sendRequest(req, proxy)
-        else:
-            req = TLRPC.TL_messages_deleteMessages()
-            arr = ArrayList()
-            arr.add(JInt(mid))
-            req.id = arr
-            req.revoke = True
-            ai.getConnectionsManager().sendRequest(req, proxy)
+            if norm_did < 0:
+                chat = mc.getChat(JLong(chat_id).longValue())
+                req = TLRPC.TL_channels_deleteMessages()
+                req.channel = mc.getInputChannel(chat) if chat else mc.getInputChannel(JLong(chat_id).longValue())
+                arr = ArrayList()
+                arr.add(JInt(mid))
+                req.id = arr
+                ai.getConnectionsManager().sendRequest(req, proxy)
+            else:
+                req = TLRPC.TL_messages_deleteMessages()
+                arr = ArrayList()
+                arr.add(JInt(mid))
+                req.id = arr
+                req.revoke = True
+                ai.getConnectionsManager().sendRequest(req, proxy)
+        except Exception as e:
+            self.log(f"Error deleting message: {e}")
 
     def _open_kanban_sheet(self):
+        try:
+            if self._sheet:
+                try:
+                    self._sheet.dismiss()
+                except Exception:
+                    pass
+                self._sheet = None
+            self._open_kanban_sheet_internal()
+        except Exception as e:
+            self.log(f"Error opening kanban sheet: {e}")
+            try:
+                BulletinHelper.show_error("Failed to open board")
+            except Exception:
+                pass
+
+    def _open_kanban_sheet_internal(self):
         activity = get_activity()
         if not activity:
             BulletinHelper.show_error("Failed to open board")
@@ -572,7 +732,7 @@ class KanbanBoardPlugin(BasePlugin):
         root = FrameLayout(ctx)
         root.setLayoutParams(FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(650)))
         bg_color = Theme.getColor(Theme.key_dialogBackground)
-        root.setBackgroundColor(bg_color)
+        root.setBackgroundColor(to_jint(bg_color))
 
         header = LinearLayout(ctx)
         header.setOrientation(LinearLayout.HORIZONTAL)
@@ -586,48 +746,41 @@ class KanbanBoardPlugin(BasePlugin):
 
         board_title_tv = TextView(ctx)
         board_title_tv.setText("Loading boards...")
-        board_title_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        board_title_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack)))
         board_title_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17)
         board_title_tv.setTypeface(Typeface.DEFAULT_BOLD)
         title_box.addView(board_title_tv)
 
         subtitle_tv = TextView(ctx)
         subtitle_tv.setText("")
-        subtitle_tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+        subtitle_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
         subtitle_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12)
         title_box.addView(subtitle_tv)
         header.addView(title_box)
 
-        res = ApplicationLoader.applicationContext.getResources()
-        pkg = ApplicationLoader.applicationContext.getPackageName()
+        icon_color = Theme.getColor(Theme.key_dialogTextGray)
 
         search_btn = ImageView(ctx)
         search_btn.setLayoutParams(LinearLayout.LayoutParams(dp(40), dp(40)))
         search_btn.setScaleType(ImageView.ScaleType.CENTER)
-        d_search = res.getDrawable(res.getIdentifier("ic_ab_search", "drawable", pkg))
+        d_search = get_themed_drawable("msg_search", icon_color) or get_themed_drawable("ic_ab_search", icon_color)
         if d_search:
-            d_search = d_search.mutate()
-            d_search.setTint(Theme.getColor(Theme.key_dialogTextGray))
             search_btn.setImageDrawable(d_search)
         header.addView(search_btn)
 
         refresh_btn = ImageView(ctx)
         refresh_btn.setLayoutParams(LinearLayout.LayoutParams(dp(40), dp(40)))
         refresh_btn.setScaleType(ImageView.ScaleType.CENTER)
-        d_refresh = res.getDrawable(res.getIdentifier("msg_retry", "drawable", pkg))
+        d_refresh = get_themed_drawable("msg_retry", icon_color)
         if d_refresh:
-            d_refresh = d_refresh.mutate()
-            d_refresh.setTint(Theme.getColor(Theme.key_dialogTextGray))
             refresh_btn.setImageDrawable(d_refresh)
         header.addView(refresh_btn)
 
         close_btn = ImageView(ctx)
         close_btn.setLayoutParams(LinearLayout.LayoutParams(dp(40), dp(40)))
         close_btn.setScaleType(ImageView.ScaleType.CENTER)
-        d_close = res.getDrawable(res.getIdentifier("msg_close", "drawable", pkg))
+        d_close = get_themed_drawable("msg_close", icon_color) or get_themed_drawable("ic_close_white", icon_color)
         if d_close:
-            d_close = d_close.mutate()
-            d_close.setTint(Theme.getColor(Theme.key_dialogTextGray))
             close_btn.setImageDrawable(d_close)
         header.addView(close_btn)
         root.addView(header)
@@ -648,8 +801,8 @@ class KanbanBoardPlugin(BasePlugin):
         search_edit.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         search_edit.setBackground(None)
         search_edit.setHint("Search tasks...")
-        search_edit.setHintTextColor(0x77FFFFFF)
-        search_edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        search_edit.setHintTextColor(to_jint(0x77FFFFFF))
+        search_edit.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack)))
         search_edit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
         search_edit.setInputType(InputType.TYPE_CLASS_TEXT)
         search_container.addView(search_edit)
@@ -695,10 +848,8 @@ class KanbanBoardPlugin(BasePlugin):
 
         fab_iv = ImageView(ctx)
         fab_iv.setLayoutParams(FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
-        d_plus = res.getDrawable(res.getIdentifier("msg_add", "drawable", pkg))
+        d_plus = get_themed_drawable("msg_add", Color.WHITE)
         if d_plus:
-            d_plus = d_plus.mutate()
-            d_plus.setTint(Color.WHITE)
             fab_iv.setImageDrawable(d_plus)
         fab.addView(fab_iv)
         root.addView(fab)
@@ -729,7 +880,7 @@ class KanbanBoardPlugin(BasePlugin):
 
                 tv = TextView(ctx)
                 tv.setText(f"{c_title} ({count})")
-                tv.setTextColor(Color.WHITE if is_active else Theme.getColor(Theme.key_dialogTextGray))
+                tv.setTextColor(to_jint(Color.WHITE if is_active else Theme.getColor(Theme.key_dialogTextGray)))
                 tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                 if is_active:
                     tv.setTypeface(Typeface.DEFAULT_BOLD)
@@ -757,12 +908,12 @@ class KanbanBoardPlugin(BasePlugin):
                 )
             ]
 
-            subtitle_tv.setText(f"{len(self._tasks)} total tasks")
+            subtitle_tv.setText(f"{len(self._tasks)} tasks")
 
             if not filtered:
                 empty_tv = TextView(ctx)
                 empty_tv.setText("No tasks in this column")
-                empty_tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+                empty_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
                 empty_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
                 empty_tv.setGravity(Gravity.CENTER)
                 empty_tv.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(150)))
@@ -788,7 +939,7 @@ class KanbanBoardPlugin(BasePlugin):
 
                 title_tv = TextView(ctx)
                 title_tv.setText(task.get("title", ""))
-                title_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                title_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack)))
                 title_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15)
                 title_tv.setTypeface(Typeface.DEFAULT_BOLD)
                 t_lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
@@ -800,7 +951,7 @@ class KanbanBoardPlugin(BasePlugin):
                     prev_col = cols[curr_idx - 1]
                     left_btn = TextView(ctx)
                     left_btn.setText("<")
-                    left_btn.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+                    left_btn.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
                     left_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                     left_btn.setPadding(dp(8), dp(4), dp(8), dp(4))
                     left_btn.setBackground(create_rounded_drawable(0x1AFFFFFF, 6.0))
@@ -817,7 +968,7 @@ class KanbanBoardPlugin(BasePlugin):
                     next_col = cols[curr_idx + 1]
                     right_btn = TextView(ctx)
                     right_btn.setText(">")
-                    right_btn.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+                    right_btn.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
                     right_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                     right_btn.setPadding(dp(8), dp(4), dp(8), dp(4))
                     right_btn.setBackground(create_rounded_drawable(0x1AFFFFFF, 6.0))
@@ -842,7 +993,7 @@ class KanbanBoardPlugin(BasePlugin):
                     if pure_desc:
                         desc_tv = TextView(ctx)
                         desc_tv.setText(pure_desc)
-                        desc_tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+                        desc_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
                         desc_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                         desc_tv.setMaxLines(3)
                         d_lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -869,14 +1020,14 @@ class KanbanBoardPlugin(BasePlugin):
                         icon_tv = TextView(ctx)
                         is_checked = item_dict["checked"]
                         icon_tv.setText("[x] " if is_checked else "[ ] ")
-                        icon_tv.setTextColor(0xFF4CAF50 if is_checked else Theme.getColor(Theme.key_dialogTextGray))
+                        icon_tv.setTextColor(to_jint(0xFF4CAF50 if is_checked else Theme.getColor(Theme.key_dialogTextGray)))
                         icon_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                         icon_tv.setTypeface(Typeface.MONOSPACE)
                         row.addView(icon_tv)
 
                         item_tv = TextView(ctx)
                         item_tv.setText(item_dict["text"])
-                        item_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack) if not is_checked else Theme.getColor(Theme.key_dialogTextGray))
+                        item_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack) if not is_checked else Theme.getColor(Theme.key_dialogTextGray)))
                         item_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
                         row.addView(item_tv)
 
@@ -904,7 +1055,7 @@ class KanbanBoardPlugin(BasePlugin):
                 prio_pill.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10)
                 prio_pill.setTypeface(Typeface.DEFAULT_BOLD)
                 prio_color = Color.parseColor(prio_info.get("color", "#fabd2f"))
-                prio_pill.setTextColor(prio_color)
+                prio_pill.setTextColor(to_jint(prio_color))
                 prio_pill.setPadding(dp(6), dp(2), dp(6), dp(2))
                 prio_pill.setBackground(create_rounded_drawable(0x22FFFFFF, 4.0, prio_color, 1.0))
                 bottom_row.addView(prio_pill)
@@ -912,20 +1063,20 @@ class KanbanBoardPlugin(BasePlugin):
                 if task.get("total_check", 0) > 0:
                     prog_tv = TextView(ctx)
                     prog_tv.setText(f"  {task['done_check']}/{task['total_check']}")
-                    prog_tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+                    prog_tv.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
                     prog_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11)
                     bottom_row.addView(prog_tv)
 
                 id_tv = TextView(ctx)
                 id_tv.setText(f"  #{task['id']}")
-                id_tv.setTextColor(0x66FFFFFF)
+                id_tv.setTextColor(to_jint(0x66FFFFFF))
                 id_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11)
                 id_tv.setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0))
                 bottom_row.addView(id_tv)
 
                 del_btn = TextView(ctx)
                 del_btn.setText("Delete")
-                del_btn.setTextColor(0xFFE53935)
+                del_btn.setTextColor(to_jint(0xFFE53935))
                 del_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11)
                 del_btn.setPadding(dp(6), dp(4), dp(6), dp(4))
 
@@ -995,6 +1146,8 @@ class KanbanBoardPlugin(BasePlugin):
         self._keep_alive_proxies.append(search_proxy)
         search_btn.setOnClickListener(search_proxy)
 
+        plugin_self = self
+
         class SearchWatcher(dynamic_proxy(TextWatcher)):
             def beforeTextChanged(self, s, start, count, after):
                 pass
@@ -1004,7 +1157,6 @@ class KanbanBoardPlugin(BasePlugin):
                 plugin_self._search_query = str(s.toString()) if s else ""
                 render_cards()
 
-        plugin_self = self
         watcher_proxy = SearchWatcher()
         self._keep_alive_proxies.append(watcher_proxy)
         search_edit.addTextChangedListener(watcher_proxy)
@@ -1049,28 +1201,32 @@ class KanbanBoardPlugin(BasePlugin):
         if not match_task:
             return
 
-        body = raw_text[:match_task.start()]
-        footer = raw_text[match_task.start():]
-        lines = body.splitlines()
-
-        line_idx = item_dict["line_idx"]
-        if line_idx < 0 or line_idx >= len(lines):
+        lines = raw_text.splitlines()
+        target_idx = item_dict["line_idx"]
+        if target_idx >= len(lines):
             return
 
-        curr_line = lines[line_idx]
-        cm = CHECKLIST_LINE_REGEX.match(curr_line)
+        target_line = lines[target_idx]
+        cm = CHECKLIST_LINE_REGEX.match(target_line)
         if not cm:
             return
 
-        new_check = " " if item_dict["checked"] else "x"
-        lines[line_idx] = f"{cm.group(1)}[{new_check}] {cm.group(3)}"
-        new_text = "\n".join(lines) + footer
+        prefix = cm.group(1)
+        old_state = cm.group(2)
+        text = cm.group(3)
+        new_state = " " if old_state.lower() == "x" else "x"
+        lines[target_idx] = f"{prefix}[{new_state}] {text}"
+        new_raw_text = "\n".join(lines)
 
-        item_dict["checked"] = not item_dict["checked"]
-        task["raw_text"] = new_text
-        task["done_check"] = sum(1 for c in task["checklist"] if c["checked"])
+        def on_done(success):
+            if success:
+                item_dict["checked"] = (new_state == "x")
+                task["raw_text"] = new_raw_text
+                task["done_check"] = sum(1 for c in task["checklist"] if c["checked"])
+                if self._sheet:
+                    self._open_kanban_sheet()
 
-        self._send_edit_message(task["id"], new_text)
+        self._send_edit_message(task["id"], new_raw_text, on_done)
 
     def _move_task_column(self, task: Dict[str, Any], target_col_id: str):
         raw_text = task["raw_text"]
@@ -1084,28 +1240,32 @@ class KanbanBoardPlugin(BasePlugin):
             meta = {}
 
         meta["col"] = target_col_id
+        target_tasks = [t for t in self._tasks if t.get("col") == target_col_id]
+        meta["pos"] = (max(t.get("pos", 1000) for t in target_tasks) + 1000) if target_tasks else 1000
+
         body = raw_text[:match_task.start()].strip()
-        new_text = f"{body}\n\n---\n<!--kanban:{json.dumps(meta)}-->"
+        new_raw_text = f"{body}\n\n---\n<!--kanban:{json.dumps(meta)}-->"
 
-        task["col"] = target_col_id
-        task["raw_text"] = new_text
+        def on_done(success):
+            if success:
+                task["col"] = target_col_id
+                task["pos"] = meta["pos"]
+                task["raw_text"] = new_raw_text
+                if self._sheet:
+                    self._open_kanban_sheet()
 
-        if self._sheet:
-            self._open_kanban_sheet()
-
-        self._send_edit_message(task["id"], new_text)
+        self._send_edit_message(task["id"], new_raw_text, on_done)
 
     def _confirm_delete_task(self, task: Dict[str, Any]):
         activity = get_activity()
         if not activity:
             return
-
         builder = AlertDialogBuilder(activity)
-        builder.setTitle("Delete Task?")
-        builder.setMessage(f"\"{task.get('title')}\"\n\nThis message will be deleted from Telegram.")
+        builder.setTitle("Delete Task")
+        builder.setMessage(f"Are you sure you want to delete task \"{task['title']}\"?")
 
         def on_confirm():
-            self._send_delete_message(task["id"], lambda success: run_on_ui_thread(lambda: self._on_task_deleted(task)))
+            self._send_delete_message(task["id"], lambda success: run_on_ui_thread(lambda: self._on_task_deleted(task) if success else None))
 
         builder.setPositiveButton("Delete", lambda: on_confirm())
         builder.setNegativeButton("Cancel", None)
@@ -1127,15 +1287,15 @@ class KanbanBoardPlugin(BasePlugin):
 
         title_et = EditText(ctx)
         title_et.setHint("Task Title *")
-        title_et.setHintTextColor(0x77FFFFFF)
-        title_et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        title_et.setHintTextColor(to_jint(0x77FFFFFF))
+        title_et.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack)))
         title_et.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15)
         layout.addView(title_et)
 
         desc_et = EditText(ctx)
         desc_et.setHint("Description or checklist (- [ ] item)")
-        desc_et.setHintTextColor(0x77FFFFFF)
-        desc_et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        desc_et.setHintTextColor(to_jint(0x77FFFFFF))
+        desc_et.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextBlack)))
         desc_et.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
         desc_et.setMinLines(3)
         d_lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -1145,7 +1305,7 @@ class KanbanBoardPlugin(BasePlugin):
 
         prio_label = TextView(ctx)
         prio_label.setText("Priority:")
-        prio_label.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+        prio_label.setTextColor(to_jint(Theme.getColor(Theme.key_dialogTextGray)))
         prio_label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12)
         p_lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         p_lp.topMargin = dp(10)
@@ -1176,10 +1336,10 @@ class KanbanBoardPlugin(BasePlugin):
                 for pb, pobj in prio_buttons:
                     c = Color.parseColor(pobj.get("color", "#fabd2f"))
                     if pobj["id"] == selected_prio[0]:
-                        pb.setTextColor(Color.WHITE)
+                        pb.setTextColor(to_jint(Color.WHITE))
                         pb.setBackground(create_rounded_drawable(c, 6.0))
                     else:
-                        pb.setTextColor(c)
+                        pb.setTextColor(to_jint(c))
                         pb.setBackground(create_rounded_drawable(0x18FFFFFF, 6.0, c, 1.0))
 
             def on_prio_click(v, target_p=pid):

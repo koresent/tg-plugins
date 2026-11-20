@@ -68,7 +68,7 @@
       "name": "Telegram Kanban",
       "description": "Native mobile Kanban board synced with Telegram chats, forum topics, and Saved Messages",
       "author": "@koresent",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "icon": "exteraPlugins/1",
       "category": [
         "productivity",
@@ -77,9 +77,9 @@
       "app_version": ">=12.5.1",
       "sdk_version": ">=1.4.4.3",
       "file": "kanban_board/kanban_board.plugin",
-      "sha256": "67b19b05187ca32cb56338e18f60a386a5d05b2c1bcdf898f05ce9aa27e3f8c0",
-      "size": 51089,
-      "updated_at": "2026-11-19T15:10:56Z"
+      "sha256": "1d9d119d90a627773fa056d1f286c1230450eedc6bda2fdc0b4c36532fcbc531",
+      "size": 58757,
+      "updated_at": "2026-11-20T13:44:52Z"
     },
     {
       "id": "local_rename",
